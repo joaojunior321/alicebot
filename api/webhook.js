@@ -1,8 +1,6 @@
-const dotenv = require("dotenv");
-dotenv.config();
-
 const { bot } = require("../src/bot");
 const { initHandler } = require("../src/handlers/main");
+const { connectDB } = require("../src/database");
 
 let handlerInitialized = false;
 
@@ -12,6 +10,8 @@ module.exports = async (req, res) => {
  }
 
  try {
+ await connectDB();
+
  if (!handlerInitialized) {
  bot.deleteWebHook().catch(() => {});
  const baseUrl = `${req.headers["x-forwarded-proto"] || "https"}://${req.headers["host"]}`;

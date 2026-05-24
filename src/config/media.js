@@ -48,4 +48,11 @@ const photoList = [
     { keyword: "diculpa", photoUrl: "https://i.imgur.com/QumF8HB.jpeg" },
 ];
 
-module.exports = { audioList, photoList };
+const videoReplyList = [
+ {
+ file_unique_id: "AgADLwcAAtzsmEQ",
+ replyText: "Ola bruxo,quanto tempo, tá sumido, saudades de você meu amor!!",
+ },
+];
+
+module.exports = { audioList, photoList, videoReplyList };

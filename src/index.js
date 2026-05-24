@@ -1,15 +1,23 @@
-const dotenv = require("dotenv");
-dotenv.config();
+if (process.env.NODE_ENV !== "production") {
+ const dotenv = require("dotenv");
+ dotenv.config();
+}
 
 const { initHandler } = require("./handlers/main.js");
 const { bot } = require("./bot");
+const { connectDB } = require("./database");
 
 const useWebhook = process.env.VERCEL === "1";
 
 if (useWebhook) {
  console.log("Running in Vercel webhook mode. Handler initialized via /api/webhook.");
 } else {
- initHandler();
+ connectDB()
+ .then(() => initHandler())
+ .catch((err) => {
+ console.error("Erro ao conectar ao MongoDB:", err.message);
+ process.exit(1);
+ });
 
  const http = require("http");
  const port = process.env.PORT || 8080;

@@ -3,7 +3,7 @@ const { bot } = require("../bot");
 const CronJob = require("cron").CronJob;
 const { setTimeout: delay } = require("timers/promises");
 const palavrasProibidas = require("./palavrasproibida.json");
-const { audioList, photoList } = require("../config/media");
+const { audioList, photoList, videoReplyList } = require("../config/media");
 const { adsterra } = require("../config/ads");
 
 require("./errors.js");
@@ -254,7 +254,7 @@ async function sendReplyByType(chatId, replyToSend, replyToMessageId, knownType)
 // ─── answer user ──────────────────────────────────────────────────────────────
 
 async function answerUser(message) {
- const received = message.sticker?.file_unique_id ?? message.text;
+ const received = message.sticker?.file_unique_id ?? message.video?.file_unique_id ?? message.text;
  const chatId = message.chat.id;
  const isGroup = message.chat.type === "group" || message.chat.type === "supergroup";
 
@@ -267,6 +267,16 @@ async function answerUser(message) {
  if (/^[\/.!]/.test(received)) return;
 
  const sendOpts = { reply_to_message_id: message.message_id };
+
+ if (message.video) {
+ const videoMatch = videoReplyList.find((v) => v.file_unique_id === message.video.file_unique_id);
+ if (videoMatch) {
+ await bot.sendChatAction(chatId, "typing");
+ await delay(800);
+ await bot.sendMessage(chatId, videoMatch.replyText, sendOpts);
+ return;
+ }
+ }
 
  const audioMatch = audioList.find((a) => received === a.keyword);
  if (audioMatch) {
@@ -316,10 +326,10 @@ async function main(message) {
         await ensureUserSaved(message);
     }
 
-    if (message.sticker || message.text) {
-        if (replyTo && replyTo.from.id !== botId) addReply(message);
-        if (!replyTo || replyTo.from.id === botId) answerUser(message);
-    }
+ if (message.sticker || message.video || message.text) {
+ if (replyTo && replyTo.from.id !== botId) addReply(message);
+ if (!replyTo || replyTo.from.id === botId) answerUser(message);
+ }
 }
 
 // ─── user / group registration ────────────────────────────────────────────────
@@ -457,7 +467,7 @@ async function ensureUserSaved(message) {
           lang_code: langCode,
         },
       },
-      { upsert: true, new: true }
+      { upsert: true, returnDocument: "after" }
     );
     if (result._id) return true;
     return false;

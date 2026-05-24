@@ -1,10 +1,10 @@
-const { v4: uuidv4 } = require("uuid");
+const { randomUUID } = require("crypto");
 
 process.on("unhandledRejection", async (reason, promise) => {
-    const errorMessage = `Error: ${reason?.message ?? reason}`;
-    const errorId = uuidv4();
+ const errorMessage = `Error: ${reason?.message ?? reason}`;
+ const errorId = randomUUID();
 
-    console.error(`Error = ${errorMessage}`);
+ console.error(`[${errorId}] ${errorMessage}`);
 });
 
 module.exports = process;
