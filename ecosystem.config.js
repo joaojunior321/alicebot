@@ -3,12 +3,12 @@ module.exports = {
  {
  name: "alice",
  script: "./src/index.js",
+ instances: 1,
+ autorestart: true,
+ watch: false,
+ max_memory_restart: "200M",
  env: {
- DB_STRING: "",
- PORT: 8080,
- TELEGRAM_API: "",
- BOT_NAME: "Alice",
- BOT_USERNAME: "aliceevilloficialbot",
+ NODE_ENV: "production",
  },
  },
  ],
