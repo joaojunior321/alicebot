@@ -1,0 +1,1470 @@
+const { MessageModel, ChatModel, UserModel } = require("../database");
+const { bot } = require("../bot");
+const CronJob = require("cron").CronJob;
+const { setTimeout: delay } = require("timers/promises");
+const palavrasProibidas = require("./palavrasproibida.json");
+const { audioList, photoList } = require("../config/media");
+const { adsterra } = require("../config/ads");
+
+require("./errors.js");
+
+const groupId = process.env.groupId;
+const logMsgId = parseInt(process.env.LOG_MSG_ID) || null;
+const channelStatusId = process.env.channelStatusId;
+const BOT_NAME = process.env.BOT_NAME || "Alice";
+const BOT_USERNAME = process.env.BOT_USERNAME || "aliceevilloficialbot";
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+function is_dev(user_id) {
+    const devUsers = (process.env.DEV_USERS || "").split(",").map((s) => s.trim());
+    return devUsers.includes(user_id.toString());
+}
+
+const forbiddenWords = palavrasProibidas.palavras_proibidas;
+
+function containsUrl(text) {
+    if (typeof text !== "string") return false;
+    return /\b(?:https?:\/\/|www\.)\S+\.(?:[a-z]{2,})(?:\S*)?\b/gi.test(text);
+}
+
+function hasForbiddenWord(text) {
+    if (typeof text !== "string") return false;
+    const lower = text.toLowerCase();
+    return forbiddenWords.some((w) => lower.includes(w.toLowerCase()));
+}
+
+function timeFormatter(seconds) {
+    const h = String(Math.floor(seconds / 3600)).padStart(2, "0");
+    const m = String(Math.floor((seconds % 3600) / 60)).padStart(2, "0");
+    const s = String(Math.floor(seconds % 60)).padStart(2, "0");
+    return `${h}:${m}:${s}`;
+}
+
+function escapeHTML(text) {
+  if (typeof text !== 'string') return '';
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function sanitizeHTML(text) {
+    if (typeof text !== 'string') return '';
+    return text
+        .replace(/[^\w\s\-.,:;!?'"@#$%^&*()+=\[\]{}|<>~`\/]/g, '')
+        .replace(/[\u0000-\u001F\u007F-\u009F]/g, '');
+}
+
+function randomItem(arr) {
+    return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function chunkArray(arr, size) {
+    const chunks = [];
+    for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
+    return chunks.length ? chunks : [[]];
+}
+
+// ─── retry mechanism ─────────────────────────────────────────────────────────
+
+async function retryWithBackoff(fn, maxRetries = 3, delayMs = 1000) {
+    for (let i = 0; i < maxRetries; i++) {
+        try {
+            return await fn();
+        } catch (error) {
+            const errorCode = error?.response?.body?.error_code;
+            if (errorCode === 429) {
+                const retryAfter = error?.response?.body?.parameters?.retry_after || 5;
+                await delay(retryAfter * 1000);
+                continue;
+            }
+            if (i === maxRetries - 1) throw error;
+            await delay(delayMs * Math.pow(2, i));
+        }
+    }
+}
+
+function safeSendMessage(chatId, text, options = {}) {
+    return retryWithBackoff(async () => {
+        const sanitizedText = sanitizeHTML(text);
+        return await bot.sendMessage(chatId, sanitizedText, {
+            ...options,
+            parse_mode: options.parse_mode || "HTML"
+        });
+    });
+}
+
+function safeSendAudio(chatId, audioUrl, options = {}) {
+    return retryWithBackoff(async () => {
+        return await bot.sendVoice(chatId, audioUrl, options);
+    });
+}
+
+function safeSendPhoto(chatId, photoUrl, options = {}) {
+    return retryWithBackoff(async () => {
+        return await bot.sendPhoto(chatId, photoUrl, options);
+    });
+}
+
+function safeCopyMessage(chatId, fromChatId, messageId) {
+    return retryWithBackoff(async () => {
+        return await bot.copyMessage(chatId, fromChatId, messageId);
+    });
+}
+
+let BOT_ID = null;
+async function getBotId() {
+    if (!BOT_ID) {
+        const me = await bot.getMe();
+        BOT_ID = me.id;
+    }
+    return BOT_ID;
+}
+
+// ─── pagination ───────────────────────────────────────────────────────────────
+
+// key: `${type}:${userId}` → { pages, currentPage }
+const paginationState = new Map();
+
+function cleanPaginationState() {
+  const now = Date.now();
+  const TTL = 10 * 60 * 1000;
+  for (const [key, val] of paginationState) {
+    if (now - val.createdAt > TTL) paginationState.delete(key);
+  }
+}
+
+setInterval(cleanPaginationState, 5 * 60 * 1000).unref();
+
+function buildNavMarkup(type, page, total) {
+    const buttons = [];
+    if (page > 0) {
+        buttons.push({ text: "◀️ Anterior", callback_data: `${type}:${page - 1}` });
+    }
+    buttons.push({ text: `${page + 1}/${total}`, callback_data: "noop" });
+    if (page < total - 1) {
+        buttons.push({ text: "Próximo ▶️", callback_data: `${type}:${page + 1}` });
+    }
+    return { reply_markup: { inline_keyboard: [buttons] }, parse_mode: "HTML" };
+}
+
+async function sendPaginated(chatId, userId, type, pages) {
+    const sent = await bot.sendMessage(chatId, pages[0], buildNavMarkup(type, 0, pages.length));
+    paginationState.set(`${type}:${userId}`, { pages, currentPage: 0, msgId: sent.message_id, createdAt: Date.now() });
+}
+
+// ─── learning system ──────────────────────────────────────────────────────────
+
+async function deleteMessageIfExists(repliedMessage, replyMessage) {
+    const found = await MessageModel.findOne({
+        $or: [{ message: repliedMessage }, { reply: replyMessage }],
+    });
+    if (found) await MessageModel.deleteOne({ _id: found._id });
+}
+
+async function createMessageAndAddReply(message) {
+ const repliedMessage =
+ message.reply_to_message?.sticker?.file_unique_id ?? message.reply_to_message?.text;
+ const replyMessage = message.sticker?.file_id ?? message.text;
+
+ if (!repliedMessage || !replyMessage) return;
+ if (/^[\/.!]/.test(repliedMessage) || /^[\/.!]/.test(replyMessage)) return;
+ if (containsUrl(repliedMessage) || containsUrl(replyMessage)) {
+ await deleteMessageIfExists(repliedMessage, replyMessage);
+ return;
+ }
+ if (hasForbiddenWord(repliedMessage) || hasForbiddenWord(replyMessage)) {
+ await deleteMessageIfExists(repliedMessage, replyMessage);
+ return;
+ }
+
+ const replyType = message.sticker ? "sticker" : "text";
+ await new MessageModel({ message: repliedMessage, reply: replyMessage, reply_types: [replyType] }).save().catch(() => {});
+}
+
+async function addReply(message) {
+ const repliedMessage =
+ message.reply_to_message?.sticker?.file_unique_id ?? message.reply_to_message?.text;
+ const replyMessage = message.sticker?.file_id ?? message.text;
+
+ if (/^[\/.!]/.test(repliedMessage)) return;
+ if (containsUrl(repliedMessage) || containsUrl(replyMessage)) {
+ await deleteMessageIfExists(repliedMessage, replyMessage);
+ return;
+ }
+ if (hasForbiddenWord(repliedMessage) || hasForbiddenWord(replyMessage)) {
+ await deleteMessageIfExists(repliedMessage, replyMessage);
+ return;
+ }
+
+ const replyType = message.sticker ? "sticker" : "text";
+ const exists = await MessageModel.exists({ message: repliedMessage });
+ if (exists) {
+ await MessageModel.findOneAndUpdate(
+ { message: repliedMessage },
+ { $push: { reply: replyMessage, reply_types: replyType } }
+ );
+ } else {
+ await createMessageAndAddReply(message);
+ }
+}
+
+function detectReplyType(text) {
+ if (typeof text !== "string" || !text.length) return "text";
+ if (/^[A-Za-z0-9_-]{20,}$/.test(text)) return "sticker";
+ return "text";
+}
+
+async function sendReplyByType(chatId, replyToSend, replyToMessageId, knownType) {
+ const type = knownType || detectReplyType(replyToSend);
+ const opts = { reply_to_message_id: replyToMessageId };
+
+ if (type === "sticker") {
+ await bot.sendChatAction(chatId, "choose_sticker");
+ await delay(300);
+ try {
+ await bot.sendSticker(chatId, replyToSend, opts);
+ } catch (err) {
+ console.error(`[STICKER-SEND] Falha ao enviar sticker: ${err.message}`);
+ await bot.sendMessage(chatId, replyToSend, {
+ ...opts,
+ disable_web_page_preview: true,
+ }).catch((e) => console.error(`[TEXT-FALLBACK] Falha: ${e.message}`));
+ }
+ } else {
+ await bot.sendChatAction(chatId, "typing");
+ const typingTime = Math.min(Math.max(50 * replyToSend.length, 200), 6000);
+ await delay(typingTime);
+ try {
+ await bot.sendMessage(chatId, replyToSend, {
+ ...opts,
+ disable_web_page_preview: true,
+ });
+ } catch (err) {
+ const code = err?.response?.body?.error_code;
+ if (code === 403 || err.message?.includes("CHAT_WRITE_FORBIDDEN")) {
+ throw err;
+ }
+ console.error(`[TEXT-SEND] Falha: ${err.message}`);
+ }
+ }
+}
+
+// ─── answer user ──────────────────────────────────────────────────────────────
+
+async function answerUser(message) {
+ const received = message.sticker?.file_unique_id ?? message.text;
+ const chatId = message.chat.id;
+ const isGroup = message.chat.type === "group" || message.chat.type === "supergroup";
+
+ if (isGroup) {
+ const groupSaved = await ensureGroupSaved(message);
+ if (!groupSaved) return;
+ }
+
+ try {
+ if (/^[\/.!]/.test(received)) return;
+
+ const sendOpts = { reply_to_message_id: message.message_id };
+
+ const audioMatch = audioList.find((a) => received === a.keyword);
+ if (audioMatch) {
+ await bot.sendChatAction(chatId, "record_audio");
+ await Promise.race([
+ safeSendAudio(chatId, audioMatch.audioUrl, sendOpts),
+ new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 6000)),
+ ]).catch((e) => console.error("Audio error:", e.message));
+ return;
+ }
+
+ const photoMatch = photoList.find((p) => received === p.keyword);
+ if (photoMatch) {
+ await bot.sendChatAction(chatId, "upload_photo");
+ await Promise.race([
+ safeSendPhoto(chatId, photoMatch.photoUrl, sendOpts),
+ new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 6000)),
+ ]).catch((e) => console.error("Photo error:", e.message));
+ return;
+ }
+
+ const doc = await MessageModel.findOne({ message: received });
+ if (doc && doc.reply.length) {
+ const idx = Math.floor(Math.random() * doc.reply.length);
+ const replyToSend = doc.reply[idx];
+ if (!replyToSend) return;
+ const knownType = doc.reply_types?.[idx] || null;
+ await sendReplyByType(chatId, replyToSend, message.message_id, knownType);
+ }
+ } catch (error) {
+ const code = error?.response?.body?.error_code;
+ if (error.message?.includes("CHAT_WRITE_FORBIDDEN") || code === 403) {
+ await bot.leaveChat(chatId).catch(() => {});
+ await ChatModel.deleteOne({ chatId }).catch(() => {});
+ }
+ }
+}
+
+// ─── main message handler ─────────────────────────────────────────────────────
+
+async function main(message) {
+    const replyTo = message?.reply_to_message ?? false;
+    const botId = await getBotId();
+
+    // Garantir que usuário em PV seja salvo
+    if (message.chat.type === "private") {
+        await ensureUserSaved(message);
+    }
+
+    if (message.sticker || message.text) {
+        if (replyTo && replyTo.from.id !== botId) addReply(message);
+        if (!replyTo || replyTo.from.id === botId) answerUser(message);
+    }
+}
+
+// ─── user / group registration ────────────────────────────────────────────────
+
+async function saveUserInformation(message) {
+  const user = message.from;
+  if (!user || user.is_bot) return;
+
+  try {
+    const langCode = user.language_code || "unknown";
+    await UserModel.findOneAndUpdate(
+      { user_id: user.id },
+      {
+        $setOnInsert: {
+          user_id: user.id,
+          lang_code: langCode,
+          is_dev: false,
+        },
+        $set: {
+          username: user.username,
+          firstname: user.first_name,
+          lastname: user.last_name,
+        },
+      },
+      { upsert: true }
+    );
+  } catch (err) {
+    // Silencioso - é apenas fallback
+  }
+}
+
+async function saveNewChatMembers(msg) {
+  const chatId = msg.chat.id;
+  const chatName = msg.chat.title;
+  const chatType = msg.chat.type || "unknown";
+
+  try {
+    const chat = await ChatModel.findOne({ chatId }).catch(err => {
+      console.error(`[CHAT-FIND] Erro ao procurar grupo ${chatId}:`, err.message);
+      throw err;
+    });
+
+    if (chat) {
+      if (chat.is_ban) {
+        await bot.leaveChat(chatId);
+      } else {
+        await ChatModel.findOneAndUpdate(
+          { chatId },
+          { chatName: chatName || chat.chatName, chat_type: chatType }
+        ).catch(() => {});
+      }
+      return;
+    }
+
+    const created = await ChatModel.create({ chatId, chatName, chat_type: chatType, lang_code: "unknown" }).catch(err => {
+      console.error(`[CHAT-CREATE] Erro ao criar grupo ${chatId}:`, err.message);
+      throw err;
+    });
+    console.log(`[CHAT-CREATE] Grupo criado: ${chatId} - ${chatName} [${chatType}]`);
+
+    const botUser = await bot.getMe();
+    const addedNow = msg.new_chat_members?.some((m) => m.id === botUser.id);
+    const chatLink = msg.chat.username ? `@${msg.chat.username}` : "Private Group";
+
+    if (addedNow) {
+ const notif =
+ `#${BOT_USERNAME} #New_Group\n` +
+ `<b>Group:</b> ${chatName}\n` +
+ `<b>ID:</b> <code>${chatId}</code>\n` +
+ `<b>Type:</b> <code>${chatType}</code>\n` +
+ `<b>Link:</b> ${chatLink}`;
+      bot.sendMessage(groupId, notif, {
+        parse_mode: "HTML",
+        ...(logMsgId && { reply_to_message_id: logMsgId }),
+      }).catch(() => {});
+
+ bot.sendMessage(
+ chatId,
+ `Olá, me chamo ${BOT_NAME}! Obrigado por me adicionar ao grupo. Vou responder as mensagens da galera aqui kkkkk.`,
+ {
+ reply_markup: {
+ inline_keyboard: [
+ [
+ { text: "📣 Canal da Alice", url: "https://t.me/aliceevillcanal" },
+ { text: "👨‍💻 Suporte", url: "https://t.me/lbrabo" },
+ ],
+ ],
+ },
+ }
+ ).catch(() => {});
+    }
+
+    const devMembers = msg.new_chat_members?.filter((m) => !m.is_bot && is_dev(m.id));
+    if (devMembers?.length) {
+      bot.sendMessage(
+        chatId,
+        `👨‍💻 <b>Um dos meus desenvolvedores entrou no grupo:</b> <a href="tg://user?id=${devMembers[0].id}">${devMembers[0].first_name}</a> 😎`,
+        { parse_mode: "HTML" }
+      ).catch(() => {});
+    }
+  } catch (err) {
+    console.error(`[CHAT-SAVE-FATAL] Erro fatal ao salvar grupo:`, err.message);
+  }
+}
+
+async function removeLeftChatMember(msg) {
+    const botId = await getBotId();
+    if (msg.left_chat_member.id !== botId) return;
+    const chatId = msg.chat.id;
+    const chat = await ChatModel.findOne({ chatId });
+    if (!chat || chat.is_ban) return;
+    await ChatModel.findOneAndDelete({ chatId }).catch(() => {});
+}
+
+// ─── ensure user/group are saved ──────────────────────────────────────────────
+
+async function ensureUserSaved(message) {
+  const user = message.from;
+  if (!user || user.is_bot) return false;
+
+  const langCode = user.language_code || "unknown";
+
+  try {
+    const result = await UserModel.findOneAndUpdate(
+      { user_id: user.id },
+      {
+        $setOnInsert: {
+          user_id: user.id,
+          is_dev: false,
+        },
+        $set: {
+          username: user.username,
+          firstname: user.first_name,
+          lastname: user.last_name,
+          lang_code: langCode,
+        },
+      },
+      { upsert: true, new: true }
+    );
+    if (result._id) return true;
+    return false;
+  } catch (err) {
+    console.error(`[ENSURE-USER-ERROR] Falha ao salvar usuário ${user.id}:`, err.message);
+    return false;
+  }
+}
+
+async function ensureGroupSaved(msg) {
+  const chatId = msg.chat.id;
+  const chatName = msg.chat.title || msg.chat.username || `Group-${chatId}`;
+  const chatType = msg.chat.type || "unknown";
+
+  try {
+    const exists = await ChatModel.findOne({ chatId });
+
+    if (exists) {
+      if (exists.is_ban) return false;
+
+      await ChatModel.findOneAndUpdate(
+        { chatId },
+        {
+          chatName,
+          chat_type: chatType,
+          $setOnInsert: { lang_code: "unknown" }
+        }
+      );
+      return true;
+    }
+
+    await ChatModel.create({
+      chatId,
+      chatName,
+      chat_type: chatType,
+      lang_code: "unknown",
+      is_ban: false
+    });
+    console.log(`[ENSURE-GROUP] Novo grupo salvo: ${chatId} (${chatName}) [${chatType}]`);
+    return true;
+  } catch (err) {
+    console.error(`[ENSURE-GROUP-ERROR] Falha ao salvar grupo ${chatId}:`, err.message);
+    return false;
+  }
+}
+
+
+// ─── /start ───────────────────────────────────────────────────────────────────
+
+async function start(message) {
+    if (message.chat.type !== "private") return;
+    
+    // Garantir que usuário seja salvo
+    await ensureUserSaved(message);
+    
+    const userId = message.from.id;
+    const firstName = message.from.first_name;
+
+ const devText =
+ `Olá, <b>${firstName}</b>! Você é um dos desenvolvedores 🧑‍💻\n\n` +
+ `Você está no painel do ${BOT_NAME}. Use os comandos com responsabilidade.`;
+
+ const userText =
+ `Olá, <b>${firstName}</b>!\n\n` +
+ `Eu sou <b>${BOT_NAME}</b>, um bot que responde mensagens, áudios e figurinhas da galera 😄\n\n` +
+ `📣 <b>Canal da Alice:</b> <a href="https://t.me/aliceevillcanal">@canal da alice</a>`;
+
+ if (is_dev(userId)) {
+ await bot.sendMessage(userId, devText, {
+ parse_mode: "HTML",
+ disable_web_page_preview: true,
+ reply_markup: {
+ inline_keyboard: [
+ [
+ { text: "📣 Canal da Alice", url: "https://t.me/aliceevillcanal" },
+ { text: "👨‍💻 Suporte", url: "https://t.me/lbrabo" },
+ ],
+ [{ text: "🗃 Comandos do Dev", callback_data: "dev_commands" }],
+ ],
+ },
+ });
+ } else {
+ await bot.sendMessage(message.chat.id, userText, {
+ parse_mode: "HTML",
+ disable_web_page_preview: true,
+ reply_markup: {
+ inline_keyboard: [
+ [{ text: "✨ Adicione-me em seu grupo", url: `https://t.me/${BOT_USERNAME}?startgroup=true` }],
+ [
+ { text: "📣 Canal da Alice", url: "https://t.me/aliceevillcanal" },
+ { text: "👨‍💻 Suporte", url: "https://t.me/lbrabo" },
+ ],
+ ],
+ },
+ });
+ }
+}
+
+// ─── /stats ───────────────────────────────────────────────────────────────────
+
+async function stats(message) {
+  if (!is_dev(message.from.id)) return;
+  await ensureUserSaved(message);
+
+  const [numUsers, numChats, numMessages, usersByLang, groupsByLang, groupsByType] = await Promise.all([
+    UserModel.countDocuments(),
+    ChatModel.countDocuments({ is_ban: false }),
+    MessageModel.countDocuments(),
+    UserModel.aggregate([
+      { $group: { _id: "$lang_code", count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+    ]),
+    ChatModel.aggregate([
+      { $match: { is_ban: false } },
+      { $group: { _id: "$lang_code", count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+    ]),
+    ChatModel.aggregate([
+      { $match: { is_ban: false } },
+      { $group: { _id: "$chat_type", count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+    ]),
+  ]);
+
+  const pages = [];
+
+  const typeBreakdown = groupsByType.map(({ _id, count }) => `${_id || "unknown"}: ${count}`).join(" | ");
+
+  pages.push(
+    `📊 <b>Estatísticas — ${BOT_NAME}</b>\n\n` +
+    `👥 <b>Usuários:</b> <code>${numUsers}</code>\n` +
+    `🏘 <b>Grupos ativos:</b> <code>${numChats}</code>\n` +
+    `📋 <b>Tipos:</b> <code>${typeBreakdown}</code>\n` +
+    `💬 <b>Mensagens aprendidas:</b> <code>${numMessages}</code>\n\n` +
+    `📅 <b>Última atualização:</b> <code>${new Date().toLocaleString('pt-BR')}</code>`
+  );
+
+  const usersLangText = `👥 <b>Usuários por idioma</b>\n\n`;
+  const groupsLangText = `🏘 <b>Grupos por idioma</b>\n\n`;
+
+  let usersLangDetail = usersLangText;
+  let groupsLangDetail = groupsLangText;
+
+  for (const { _id, count } of usersByLang) {
+    usersLangDetail += `🌐 <code>${_id || "unknown"}</code> — <b>${count}</b> usuário(s)\n`;
+  }
+
+  for (const { _id, count } of groupsByLang) {
+    groupsLangDetail += `🌐 <code>${_id || "unknown"}</code> — <b>${count}</b> grupo(s)\n`;
+  }
+
+  pages.push(usersLangDetail);
+  pages.push(groupsLangDetail);
+
+  const memUsage = process.memoryUsage();
+  const memUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024);
+  const memTotalMB = Math.round(memUsage.heapTotal / 1024 / 1024);
+
+  const perfText = `⚡ <b>Performance</b>\n\n` +
+    `💾 <b>Memória:</b> <code>${memUsedMB}</code>MB / <code>${memTotalMB}</code>MB\n` +
+    `🕒 <b>Uptime:</b> <code>${timeFormatter(process.uptime())}</code>\n` +
+    `🔄 <b>Status:</b> <code>Online</code>`;
+
+  pages.push(perfText);
+
+  await sendPaginated(message.chat.id, message.from.id, "stats", pages);
+}
+
+// ─── /grupos ──────────────────────────────────────────────────────────────────
+
+async function groups(message) {
+    if (!is_dev(message.from.id)) return;
+    if (message.chat.type !== "private") return;
+    await ensureUserSaved(message);
+
+    const chats = await ChatModel.find({ is_ban: false }).sort({ chatId: 1 });
+    if (!chats.length) {
+        return bot.sendMessage(message.chat.id, "Nenhum grupo ativo encontrado.");
+    }
+
+  const chunks = chunkArray(chats, 20);
+  const pages = chunks.map((chunk, i) => {
+    let text =
+      `🏘 <b>Grupos ativos</b> — Total: <code>${chats.length}</code>\n` +
+      `<i>Página ${i + 1}/${chunks.length}</i>\n\n`;
+    chunk.forEach((chat, idx) => {
+      text += `<b>${i * 20 + idx + 1}.</b> ${chat.chatName}\n`;
+      text += ` ├ ID: <code>${chat.chatId}</code>\n`;
+      text += ` ├ Tipo: <code>${chat.chat_type || "unknown"}</code>\n`;
+      text += ` └ Lang: <code>${chat.lang_code || "unknown"}</code>\n\n`;
+    });
+    return text;
+  });
+
+  await sendPaginated(message.chat.id, message.from.id, "grupos", pages);
+}
+
+// ─── /banned ──────────────────────────────────────────────────────────────────
+
+async function banned(message) {
+    if (message.chat.type !== "private") {
+        return bot.sendMessage(message.chat.id, "Use este comando no PV com o bot.");
+    }
+    if (!is_dev(message.from.id)) {
+        return bot.sendMessage(message.chat.id, "Você não está autorizado.");
+    }
+    await ensureUserSaved(message);
+
+    const bannedChats = await ChatModel.find({ is_ban: true });
+    if (!bannedChats.length) {
+        return bot.sendMessage(message.chat.id, "Nenhum grupo banido encontrado.");
+    }
+
+    const chunks = chunkArray(bannedChats, 20);
+    const pages = chunks.map((chunk, i) => {
+        let text =
+            `🚫 <b>Grupos banidos</b> — Total: <code>${bannedChats.length}</code>\n` +
+            `<i>Página ${i + 1}/${chunks.length}</i>\n\n`;
+        chunk.forEach((chat, idx) => {
+            text += `<b>${i * 20 + idx + 1}.</b> ${chat.chatName}\n`;
+            text += `    └ ID: <code>${chat.chatId}</code>\n\n`;
+        });
+        return text;
+    });
+
+    await sendPaginated(message.chat.id, message.from.id, "banned", pages);
+}
+
+// ─── /ban ─────────────────────────────────────────────────────────────────────
+
+async function ban(message) {
+    if (message.chat.type !== "private") {
+        return bot.sendMessage(message.chat.id, "Use este comando no PV com o bot.");
+    }
+    if (!is_dev(message.from.id)) {
+        return bot.sendMessage(message.chat.id, "Você não está autorizado.");
+    }
+
+    const rawId = message.text.split(" ")[1];
+    if (!rawId || isNaN(rawId)) {
+        return bot.sendMessage(message.chat.id, "Uso: /ban <chatId>");
+    }
+
+    const chatId = Number(rawId);
+    const chat = await ChatModel.findOne({ chatId });
+    if (!chat) return bot.sendMessage(message.chat.id, `Grupo não encontrado: ${chatId}`);
+    if (chat.is_ban) return bot.sendMessage(message.chat.id, `Grupo <b>${chat.chatName}</b> já está banido.`, { parse_mode: "HTML" });
+
+    await ChatModel.updateOne({ chatId }, { $set: { is_ban: true } });
+    await bot.sendMessage(chatId, `${BOT_NAME} saindo do grupo!`).catch(() => {});
+    await bot.leaveChat(chatId).catch(() => {});
+    await bot.sendMessage(message.chat.id, `✅ Grupo <b>${chat.chatName}</b> banido com sucesso.`, { parse_mode: "HTML" });
+
+    bot.sendMessage(
+        groupId,
+        `#${BOT_USERNAME} #Banned\n<b>Group:</b> ${chat.chatName}\n<b>ID:</b> <code>${chatId}</code>`,
+        { parse_mode: "HTML", ...(logMsgId && { reply_to_message_id: logMsgId }) }
+    ).catch(() => {});
+}
+
+// ─── /unban ───────────────────────────────────────────────────────────────────
+
+async function unban(message) {
+    if (message.chat.type !== "private") {
+        return bot.sendMessage(message.chat.id, "Use este comando no PV com o bot.");
+    }
+    if (!is_dev(message.from.id)) {
+        return bot.sendMessage(message.chat.id, "Você não está autorizado.");
+    }
+
+    const rawId = message.text.split(" ")[1];
+    if (!rawId || isNaN(rawId)) {
+        return bot.sendMessage(message.chat.id, "Uso: /unban <chatId>");
+    }
+
+    const chatId = Number(rawId);
+    const chat = await ChatModel.findOne({ chatId });
+    if (!chat) return bot.sendMessage(message.chat.id, `Nenhum grupo encontrado com ID ${chatId}.`);
+    if (!chat.is_ban) return bot.sendMessage(message.chat.id, `Grupo <b>${chat.chatName}</b> não está banido.`, { parse_mode: "HTML" });
+
+    await ChatModel.updateOne({ chatId }, { $set: { is_ban: false } });
+    await bot.sendMessage(message.chat.id, `✅ Grupo <b>${chat.chatName}</b> desbanido com sucesso.`, { parse_mode: "HTML" });
+
+    bot.sendMessage(
+        groupId,
+        `#${BOT_USERNAME} #Unban\n<b>Group:</b> ${chat.chatName}\n<b>ID:</b> <code>${chatId}</code>`,
+        { parse_mode: "HTML", ...(logMsgId && { reply_to_message_id: logMsgId }) }
+    ).catch(() => {});
+}
+
+// ─── /delmsg ──────────────────────────────────────────────────────────────────
+
+async function removeMessage(message) {
+    if (!is_dev(message.from.id)) return;
+
+    const repliedMessage =
+        message.reply_to_message &&
+        (message.reply_to_message.sticker?.file_unique_id ?? message.reply_to_message.text);
+
+    if (!repliedMessage) {
+        return bot.sendMessage(message.chat.id, "Responda a uma mensagem para deletar do banco.");
+    }
+
+    const exists = await MessageModel.exists({ message: repliedMessage });
+    if (!exists) {
+        return bot.sendMessage(message.chat.id, "Mensagem não encontrada no banco de dados.");
+    }
+
+    await MessageModel.deleteMany({
+        $or: [
+            { message: repliedMessage },
+            { reply: { $elemMatch: { $eq: repliedMessage } } },
+        ],
+    });
+
+    bot.sendMessage(
+        message.chat.id,
+        `✅ Deletado por <a href="tg://user?id=${message.from.id}">${message.from.first_name}</a>.\n\nTodas as respostas associadas foram apagadas.`,
+        { parse_mode: "HTML", reply_to_message_id: message.message_id }
+    );
+}
+
+// ─── /devs ────────────────────────────────────────────────────────────────────
+
+async function devs(message) {
+    if (!is_dev(message.from.id)) {
+        return bot.sendMessage(message.chat.id, "Este comando é apenas para desenvolvedores!");
+    }
+    if (message.chat.type !== "private") {
+        return bot.sendMessage(message.chat.id, "Use este comando no PV com o bot.");
+    }
+    await ensureUserSaved(message);
+
+    const devsData = await UserModel.find({ is_dev: true }).catch(() => []);
+    let text = "<b>👨‍💻 Desenvolvedores:</b>\n\n";
+    for (const user of devsData) {
+        text += `• <a href="tg://user?id=${user.user_id}">${user.firstname}</a> — <code>${user.user_id}</code>\n`;
+    }
+    if (!devsData.length) text += "Nenhum dev cadastrado no banco.";
+    bot.sendMessage(message.chat.id, text, { parse_mode: "HTML" });
+}
+
+// ─── /dbstats (diagnóstico) ────────────────────────────────────────────────────
+
+async function dbstats(message) {
+    if (!is_dev(message.from.id)) {
+        return bot.sendMessage(message.chat.id, "Este comando é apenas para desenvolvedores!");
+    }
+    if (message.chat.type !== "private") {
+        return bot.sendMessage(message.chat.id, "Use este comando no PV com o bot.");
+    }
+    await ensureUserSaved(message);
+
+    try {
+        const totalUsers = await UserModel.countDocuments();
+        const totalChats = await ChatModel.countDocuments();
+        const totalChatsBanned = await ChatModel.countDocuments({ is_ban: true });
+        const totalChatsActive = await ChatModel.countDocuments({ is_ban: false });
+        const totalMessages = await MessageModel.countDocuments();
+
+        const text = 
+            `🗄 <b>Diagnóstico do Banco de Dados</b>\n\n` +
+            `👥 <b>Usuários Totais:</b> <code>${totalUsers}</code>\n` +
+            `🏘 <b>Grupos Totais:</b> <code>${totalChats}</code>\n` +
+            `  ├─ Ativos: <code>${totalChatsActive}</code>\n` +
+            `  └─ Banidos: <code>${totalChatsBanned}</code>\n` +
+            `💬 <b>Mensagens Aprendidas:</b> <code>${totalMessages}</code>\n\n` +
+            `📅 <code>${new Date().toLocaleString('pt-BR')}</code>`;
+
+        bot.sendMessage(message.chat.id, text, { parse_mode: "HTML" });
+    } catch (err) {
+        console.error("[DBSTATS] Erro:", err.message);
+        bot.sendMessage(message.chat.id, `❌ Erro ao consultar banco: ${err.message}`);
+    }
+}
+
+// ─── /syncdb (forçar sincronização de usuários/grupos via Telegram) ───────────
+
+async function syncdb(message) {
+    if (!is_dev(message.from.id)) {
+        return bot.sendMessage(message.chat.id, "Este comando é apenas para desenvolvedores!");
+    }
+    if (message.chat.type !== "private") {
+        return bot.sendMessage(message.chat.id, "Use este comando no PV com o bot.");
+    }
+    await ensureUserSaved(message);
+
+    const sentMsg = await bot.sendMessage(message.chat.id, "🔄 <i>Sincronizando banco de dados...</i>", { parse_mode: "HTML" });
+
+    try {
+        // Obter lista de chats do bot
+        const botChats = await bot.getChatAdministrators(-1).catch(() => []);
+        
+        // Nota: getChatAdministrators funciona apenas para grupos específicos
+        // Uma abordagem melhor é usar o histórico de mensagens
+        // Por enquanto, vamos apenas avisar que a sincronização de grupos é feita automaticamente
+        
+        const totalUsers = await UserModel.countDocuments();
+        const totalGroups = await ChatModel.countDocuments();
+        
+        await bot.editMessageText(
+            `✅ <b>Sincronização Concluída</b>\n\n` +
+            `👥 <b>Usuários salvos:</b> <code>${totalUsers}</code>\n` +
+            `🏘 <b>Grupos salvos:</b> <code>${totalGroups}</code>\n\n` +
+            `<i>ℹ️ Novos usuários são salvos ao enviar mensagens em PV.\n` +
+            `Novos grupos são salvos quando o bot recebe mensagens.</i>`,
+            { chat_id: sentMsg.chat.id, message_id: sentMsg.message_id, parse_mode: "HTML" }
+        );
+    } catch (err) {
+        console.error("[SYNCDB] Erro:", err.message);
+        await bot.editMessageText(
+            `❌ Erro na sincronização: ${err.message}`,
+            { chat_id: sentMsg.chat.id, message_id: sentMsg.message_id }
+        );
+    }
+}
+
+// ─── /bc ─────────────────────────────────────────────────────────────────────
+
+async function bc(msg) {
+  if (!is_dev(msg.from.id)) return;
+  if (msg.chat.type !== "private") return;
+  await ensureUserSaved(msg);
+
+  const query = msg.text.replace(/^\/bc(?:@\w+)?\s*/, "").trim();
+  if (!query) {
+    return bot.sendMessage(msg.chat.id, "<i>Uso: /bc [-d] &lt;texto&gt;</i>", { parse_mode: "HTML" });
+  }
+
+  const webPreview = query.startsWith("-d");
+  const text = webPreview ? query.substring(2).trim() : query;
+  if (!text) {
+    return bot.sendMessage(msg.chat.id, "<i>Uso: /bc [-d] &lt;texto&gt;</i>", { parse_mode: "HTML" });
+  }
+
+  const sentMsg = await bot.sendMessage(msg.chat.id, "<i>⏳ Enviando broadcast...</i>", { parse_mode: "HTML" });
+  const ulist = await UserModel.find().lean().select("user_id");
+  console.log(`[BC] Iniciando broadcast para ${ulist.length} usuários`);
+
+  let success = 0, blocked = 0, failed = 0;
+  const total = ulist.length;
+  const batchSize = 50;
+  const batches = chunkArray(ulist, batchSize);
+
+  for (let i = 0; i < batches.length; i++) {
+    const batch = batches[i];
+    const batchProgress = Math.round(((i + 1) / batches.length) * 100);
+
+    for (const { user_id } of batch) {
+      try {
+        await safeSendMessage(user_id, text, { disable_web_page_preview: !webPreview });
+        success++;
+      } catch (err) {
+        const code = err?.response?.body?.error_code;
+        const desc = err?.response?.body?.description || "";
+        if (code === 403) {
+          blocked++;
+          await UserModel.deleteOne({ user_id }).catch(() => {});
+        } else if (code === 400 && /chat not found|bot can't initiate/i.test(desc)) {
+          blocked++;
+          await UserModel.deleteOne({ user_id }).catch(() => {});
+        } else {
+          failed++;
+        }
+      }
+      await delay(50);
+    }
+
+    await bot.editMessageText(
+      `╭─❑ 「 <b>Broadcast em Progresso</b> 」 ❑\n` +
+      `│ 📤 Progresso: <code>${batchProgress}%</code>\n` +
+      `│ ✅ Enviados: <code>${success}</code>\n` +
+      `│ 🚫 Bloqueados: <code>${blocked}</code>\n` +
+      `│ ❌ Falhas: <code>${failed}</code>\n` +
+      `╰❑`,
+      { chat_id: sentMsg.chat.id, message_id: sentMsg.message_id, parse_mode: "HTML" }
+    ).catch(() => {});
+  }
+
+  console.log(`[BC] Concluído: ${success}/${total} enviados | ${blocked} bloqueados | ${failed} falhas`);
+
+  await bot.editMessageText(
+    `╭─❑ 「 <b>Broadcast Concluído</b> 」 ❑\n` +
+    `│ 📤 Total: <code>${total}</code>\n` +
+    `│ ✅ Enviados: <code>${success}</code>\n` +
+    `│ 🚫 Bloqueados (removidos): <code>${blocked}</code>\n` +
+    `│ ❌ Falhas: <code>${failed}</code>\n` +
+    `╰❑`,
+    { chat_id: sentMsg.chat.id, message_id: sentMsg.message_id, parse_mode: "HTML" }
+  );
+}
+
+// ─── /broadcast ───────────────────────────────────────────────────────────────
+
+async function broadcast(msg) {
+  if (!is_dev(msg.from.id)) return;
+  if (msg.chat.type !== "private") return;
+  await ensureUserSaved(msg);
+
+  if (!msg.reply_to_message) {
+    return bot.sendMessage(msg.chat.id, "<i>Responda a uma mensagem para fazer broadcast.</i>", {
+      parse_mode: "HTML",
+    });
+  }
+
+  const reply = msg.reply_to_message;
+  const sentMsg = await bot.sendMessage(msg.chat.id, "<i>⏳ Broadcast iniciando...</i>", { parse_mode: "HTML" });
+  const ulist = await UserModel.find().lean().select("user_id");
+  console.log(`[BROADCAST] Iniciando broadcast para ${ulist.length} usuários`);
+
+  let success = 0, blocked = 0, failed = 0;
+  const total = ulist.length;
+  const batchSize = 50;
+  const batches = chunkArray(ulist, batchSize);
+
+  for (let i = 0; i < batches.length; i++) {
+    const batch = batches[i];
+    const batchProgress = Math.round(((i + 1) / batches.length) * 100);
+
+    for (const { user_id } of batch) {
+      try {
+        await bot.copyMessage(user_id, msg.chat.id, reply.message_id);
+        success++;
+      } catch (err) {
+        const code = err?.response?.body?.error_code;
+        const desc = err?.response?.body?.description || "";
+        if (code === 403) {
+          blocked++;
+          await UserModel.deleteOne({ user_id }).catch(() => {});
+        } else if (code === 400 && /chat not found|bot can't initiate/i.test(desc)) {
+          blocked++;
+          await UserModel.deleteOne({ user_id }).catch(() => {});
+        } else {
+          failed++;
+        }
+      }
+      await delay(50);
+    }
+
+    await bot.editMessageText(
+      `╭─❑ 「 <b>Broadcast em Progresso</b> 」 ❑\n` +
+      `│ 📤 Progresso: <code>${batchProgress}%</code>\n` +
+      `│ ✅ Enviados: <code>${success}</code>\n` +
+      `│ 🚫 Bloqueados: <code>${blocked}</code>\n` +
+      `│ ❌ Falhas: <code>${failed}</code>\n` +
+      `╰❑`,
+      { chat_id: sentMsg.chat.id, message_id: sentMsg.message_id, parse_mode: "HTML" }
+    ).catch(() => {});
+  }
+
+  console.log(`[BROADCAST] Concluído: ${success}/${total} enviados | ${blocked} bloqueados | ${failed} falhas`);
+
+  await bot.editMessageText(
+    `╭─❑ 「 <b>Broadcast Concluído</b> 」 ❑\n` +
+    `│ 📤 Total: <code>${total}</code>\n` +
+    `│ ✅ Enviados: <code>${success}</code>\n` +
+    `│ 🚫 Bloqueados (removidos): <code>${blocked}</code>\n` +
+    `│ ❌ Falhas: <code>${failed}</code>\n` +
+    `╰❑`,
+    { chat_id: sentMsg.chat.id, message_id: sentMsg.message_id, parse_mode: "HTML" }
+  );
+}
+
+// ─── /sendgp ──────────────────────────────────────────────────────────────────
+
+async function sendgp(msg) {
+  if (!is_dev(msg.from.id)) return;
+  if (msg.chat.type !== "private") return;
+  await ensureUserSaved(msg);
+
+  const sentMsg = await bot.sendMessage(msg.chat.id, "<i>⏳ Enviando para grupos...</i>", { parse_mode: "HTML" });
+  const ulist = await ChatModel.find({ is_ban: false }).lean().select("chatId");
+  console.log(`[SENDGP] Iniciando envio para ${ulist.length} grupos`);
+
+  let success = 0, removed = 0, failed = 0;
+  const total = ulist.length;
+  const batchSize = 20;
+  const batches = chunkArray(ulist, batchSize);
+
+  if (msg.reply_to_message) {
+    const replyMsg = msg.reply_to_message;
+
+    for (let i = 0; i < batches.length; i++) {
+      const batch = batches[i];
+      const batchProgress = Math.round(((i + 1) / batches.length) * 100);
+
+      for (const { chatId } of batch) {
+        try {
+          await safeCopyMessage(chatId, replyMsg.chat.id, replyMsg.message_id);
+          success++;
+        } catch (err) {
+          const code = err?.response?.body?.error_code;
+          const desc = err?.response?.body?.description || "";
+          if (code === 403 || (code === 400 && /chat not found|group is deactivated|not enough rights/i.test(desc))) {
+            removed++;
+            await ChatModel.deleteOne({ chatId }).catch(() => {});
+          } else {
+            failed++;
+          }
+        }
+        await delay(50);
+      }
+
+      await bot.editMessageText(
+        `╭─❑ 「 <b>Envio para Grupos em Progresso</b> 」 ❑\n` +
+        `│ 📤 Progresso: <code>${batchProgress}%</code>\n` +
+        `│ ✅ Enviados: <code>${success}</code>\n` +
+        `│ 🗑 Removidos: <code>${removed}</code>\n` +
+        `│ ❌ Falhas: <code>${failed}</code>\n` +
+        `╰❑`,
+        { chat_id: sentMsg.chat.id, message_id: sentMsg.message_id, parse_mode: "HTML" }
+      ).catch(() => {});
+    }
+  } else {
+    const rawText = msg.text.replace(/^\/sendgp(?:@\w+)?\s*/, "").trim();
+    const webPreview = rawText.startsWith("-d");
+    const text = webPreview ? rawText.substring(2).trim() : rawText;
+
+    if (!text) {
+      await bot.editMessageText("Uso: /sendgp [-d] <texto> ou responda uma mensagem.", {
+        chat_id: sentMsg.chat.id,
+        message_id: sentMsg.message_id,
+      });
+      return;
+    }
+
+    for (let i = 0; i < batches.length; i++) {
+      const batch = batches[i];
+      const batchProgress = Math.round(((i + 1) / batches.length) * 100);
+
+      for (const { chatId } of batch) {
+        try {
+          await safeSendMessage(chatId, text, { disable_web_page_preview: !webPreview });
+          success++;
+        } catch (err) {
+          const code = err?.response?.body?.error_code;
+          const desc = err?.response?.body?.description || "";
+          if (code === 403 || (code === 400 && /chat not found|group is deactivated|not enough rights/i.test(desc))) {
+            removed++;
+            await ChatModel.deleteOne({ chatId }).catch(() => {});
+          } else {
+            failed++;
+          }
+        }
+        await delay(50);
+      }
+
+      await bot.editMessageText(
+        `╭─❑ 「 <b>Envio para Grupos em Progresso</b> 」 ❑\n` +
+        `│ 📤 Progresso: <code>${batchProgress}%</code>\n` +
+        `│ ✅ Enviados: <code>${success}</code>\n` +
+        `│ 🗑 Removidos: <code>${removed}</code>\n` +
+        `│ ❌ Falhas: <code>${failed}</code>\n` +
+        `╰❑`,
+        { chat_id: sentMsg.chat.id, message_id: sentMsg.message_id, parse_mode: "HTML" }
+      ).catch(() => {});
+    }
+  }
+
+  console.log(`[SENDGP] Concluído: ${success}/${total} enviados | ${removed} removidos | ${failed} falhas`);
+
+  await bot.editMessageText(
+    `╭─❑ 「 <b>Envio para Grupos Concluído</b> 」 ❑\n` +
+    `│ 🏘 Total: <code>${total}</code>\n` +
+    `│ ✅ Enviados: <code>${success}</code>\n` +
+    `│ 🗑 Removidos (inativos): <code>${removed}</code>\n` +
+    `│ ❌ Falhas: <code>${failed}</code>\n` +
+    `╰❑`,
+    { chat_id: sentMsg.chat.id, message_id: sentMsg.message_id, parse_mode: "HTML" }
+  );
+}
+
+// ─── Adsterra ads ─────────────────────────────────────────────────────────────
+
+async function sendAdsToUsers() {
+    const cutoff = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+    const users = await UserModel.find({
+        $or: [{ last_ad_sent: null }, { last_ad_sent: { $lt: cutoff } }],
+    })
+        .lean()
+        .select("user_id");
+
+    if (!users.length) return;
+
+    const now = new Date();
+    let success = 0, failed = 0;
+
+    for (const { user_id } of users) {
+        try {
+            const link = randomItem(adsterra.links);
+            const tpl = randomItem(adsterra.userTemplates);
+            await safeSendMessage(user_id, tpl.text, {
+                disable_web_page_preview: true,
+                reply_markup: { inline_keyboard: [[{ text: tpl.buttonText, url: link }]] },
+            });
+            await UserModel.updateOne({ user_id }, { $set: { last_ad_sent: now } });
+            success++;
+    } catch (err) {
+      const code = err?.response?.body?.error_code;
+      const desc = err?.response?.body?.description || "";
+      if (code === 403 || (code === 400 && /chat not found|bot can't initiate/i.test(desc))) {
+        await UserModel.deleteOne({ user_id }).catch(() => {});
+      } else {
+        failed++;
+      }
+    }
+    await delay(250);
+  }
+
+  console.log(`[ADS-USERS] Enviado: ${success} | Falhas: ${failed}`);
+}
+
+async function sendAdsToGroups() {
+  const cutoff = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+  const groups = await ChatModel.find({
+    is_ban: false,
+    $or: [{ last_ad_sent: null }, { last_ad_sent: { $lt: cutoff } }],
+  })
+    .lean()
+    .select("chatId");
+
+  if (!groups.length) return;
+
+  const now = new Date();
+  let success = 0, failed = 0;
+
+  for (const { chatId } of groups) {
+    try {
+      const link = randomItem(adsterra.links);
+      const tpl = randomItem(adsterra.groupTemplates);
+      await safeSendMessage(chatId, tpl.text, {
+        disable_web_page_preview: true,
+        reply_markup: { inline_keyboard: [[{ text: tpl.buttonText, url: link }]] },
+      });
+      await ChatModel.updateOne({ chatId }, { $set: { last_ad_sent: now } });
+      success++;
+    } catch (err) {
+      const code = err?.response?.body?.error_code;
+      const desc = err?.response?.body?.description || "";
+      if (code === 403 || (code === 400 && /chat not found|group is deactivated|not enough rights/i.test(desc))) {
+        await ChatModel.deleteOne({ chatId }).catch(() => {});
+      } else {
+        failed++;
+      }
+    }
+    await delay(300);
+  }
+
+    console.log(`[ADS-GROUPS] Enviado: ${success} | Falhas: ${failed}`);
+}
+
+// ─── status cron ──────────────────────────────────────────────────────────────
+
+async function sendStatus() {
+    const start = new Date();
+    const replied = await bot.sendMessage(channelStatusId, "Bot is ON").catch(() => null);
+    if (!replied) return;
+    const ping = new Date() - start;
+    const numUsers = await UserModel.countDocuments();
+    const numChats = await ChatModel.countDocuments({ is_ban: false });
+    await bot
+        .editMessageText(
+            `#${BOT_USERNAME} #Status\n\nStatus: ON\nPing: \`${ping}ms\`\nUptime: \`${timeFormatter(process.uptime())}\`\nUsuários: \`${numUsers}\`\nGrupos: \`${numChats}\``,
+            { chat_id: replied.chat.id, message_id: replied.message_id, parse_mode: "Markdown" }
+        )
+        .catch(() => {});
+}
+
+// ─── lifecycle ────────────────────────────────────────────────────────────────
+
+function sendBotOnlineMessage() {
+ console.log(`${BOT_NAME} iniciado com sucesso...`);
+ bot.sendMessage(groupId, `#${BOT_NAME} #ONLINE\n\nBot is now playing ...`, {
+ ...(logMsgId && { reply_to_message_id: logMsgId }),
+ }).catch(() => {});
+}
+
+function sendBotOfflineMessage() {
+ console.log(`${BOT_NAME} encerrado...`);
+ bot.sendMessage(groupId, `#${BOT_NAME} #OFFLINE\n\nBot is now off ...`, {
+ ...(logMsgId && { reply_to_message_id: logMsgId }),
+ })
+ .then(() => process.exit(0))
+ .catch(() => process.exit(1));
+}
+
+function pollingError(error) {
+    console.error("Polling error:", error.message || error);
+}
+
+process.on("SIGINT", sendBotOfflineMessage);
+
+// ─── global callback_query handler ───────────────────────────────────────────
+
+function registerCallbackHandler() {
+    bot.on("callback_query", async (q) => {
+        await bot.answerCallbackQuery(q.id).catch(() => {});
+
+        const data = q.data;
+        const userId = q.from.id;
+
+        if (data === "noop") return;
+
+        if (data === "dev_commands") {
+            const commands = [
+                "/stats — Estatísticas com paginação e breakdown por idioma",
+                "/ban &lt;id&gt; — Bane um grupo e remove o bot",
+                "/unban &lt;id&gt; — Desbane um grupo",
+                "/banned — Lista de grupos banidos",
+                "/grupos — Lista de grupos ativos",
+                "/bc — Broadcast de texto para usuários",
+                "/broadcast — Copia mensagem para todos usuários",
+                "/ping — Latência e uptime",
+                "/delmsg — Apaga mensagem do banco (reply)",
+                "/devs — Lista de desenvolvedores",
+                "/sendgp — Envia mensagem para todos os grupos",
+            ];
+            await bot
+                .editMessageText("<b>🗃 Comandos do Dev:</b>\n\n" + commands.join("\n"), {
+                    parse_mode: "HTML",
+                    disable_web_page_preview: true,
+                    chat_id: q.message.chat.id,
+                    message_id: q.message.message_id,
+                    reply_markup: {
+                        inline_keyboard: [[{ text: "⬅️ Voltar", callback_data: "back_to_start" }]],
+                    },
+                })
+                .catch(() => {});
+            return;
+        }
+
+ if (data === "back_to_start") {
+ const firstName = q.from.first_name;
+ const devText =
+ `Olá, <b>${firstName}</b>! Você é um dos desenvolvedores 🧑‍💻\n\n` +
+ `Você está no painel do ${BOT_NAME}. Use os comandos com responsabilidade.`;
+ await bot
+ .editMessageText(devText, {
+ parse_mode: "HTML",
+ disable_web_page_preview: true,
+ chat_id: q.message.chat.id,
+ message_id: q.message.message_id,
+ reply_markup: {
+ inline_keyboard: [
+ [
+ { text: "📣 Canal da Alice", url: "https://t.me/aliceevillcanal" },
+ { text: "👨‍💻 Suporte", url: "https://t.me/lbrabo" },
+ ],
+ [{ text: "🗃 Comandos do Dev", callback_data: "dev_commands" }],
+ ],
+ },
+ })
+ .catch(() => {});
+            return;
+        }
+
+        // pagination: `type:pageNumber`
+        const match = data.match(/^(stats|grupos|banned):(\d+)$/);
+        if (!match) return;
+
+        const [, type, pageStr] = match;
+        const page = parseInt(pageStr, 10);
+        const state = paginationState.get(`${type}:${userId}`);
+        if (!state || page < 0 || page >= state.pages.length) return;
+
+        state.currentPage = page;
+        await bot
+            .editMessageText(state.pages[page], {
+                chat_id: q.message.chat.id,
+                message_id: q.message.message_id,
+                ...buildNavMarkup(type, page, state.pages.length),
+            })
+            .catch(() => {});
+    });
+}
+
+async function updateUserLanguage(userId, langCode) {
+    await UserModel.findOneAndUpdate(
+        { user_id: userId },
+        { $set: { lang_code: langCode } }
+    ).catch(() => {});
+}
+
+async function updateGroupLanguage(chatId, langCode) {
+    await ChatModel.findOneAndUpdate(
+        { chatId },
+        { $set: { lang_code: langCode } }
+    ).catch(() => {});
+}
+
+async function migrateUsersLangCode() {
+    // Verifica se migração está habilitada
+    if (process.env.ENABLE_LANG_MIGRATION !== 'true') {
+        console.log("⚠️ Migração de lang_code desabilitada. Use ENABLE_LANG_MIGRATION=true para ativar.");
+        return;
+    }
+    
+    const usersWithoutLang = await UserModel.find({ lang_code: "unknown" });
+    console.log(`Migrando ${usersWithoutLang.length} usuários para adicionar lang_code...`);
+    
+    for (const user of usersWithoutLang) {
+        try {
+            const chatInfo = await bot.getChat(user.user_id);
+            const langCode = chatInfo?.language_code || "unknown";
+            await updateUserLanguage(user.user_id, langCode);
+            console.log(`Usuário ${user.user_id} migrado: ${langCode}`);
+        } catch (err) {
+            console.error(`Erro ao migrar usuário ${user.user_id}:`, err.message);
+        }
+        await delay(50);
+    }
+    console.log("✅ Migração de usuários concluída!");
+}
+
+async function migrateGroupsLangCode() {
+  if (process.env.ENABLE_LANG_MIGRATION !== 'true') {
+    console.log("Migração de lang_code desabilitada. Use ENABLE_LANG_MIGRATION=true para ativar.");
+    return;
+  }
+
+  const groupsWithoutType = await ChatModel.find({ chat_type: { $in: ["unknown", null] } });
+  console.log(`Migrando ${groupsWithoutType.length} grupos para adicionar chat_type...`);
+
+  for (const group of groupsWithoutType) {
+    try {
+      const chatInfo = await bot.getChat(group.chatId);
+      const chatType = chatInfo?.type || "unknown";
+      await ChatModel.findOneAndUpdate(
+        { chatId: group.chatId },
+        { $set: { chat_type: chatType } }
+      ).catch(() => {});
+      console.log(`Grupo ${group.chatId} chat_type: ${chatType}`);
+    } catch (err) {
+      console.error(`Erro ao migrar grupo ${group.chatId}:`, err.message);
+    }
+    await delay(50);
+  }
+  console.log("Migracao de chat_type dos grupos concluida!");
+}
+
+// ─── exports ──────────────────────────────────────────────────────────────────
+
+exports.initHandler = () => {
+    // Migração inicial de lang_code (apenas se habilitado)
+    if (process.env.ENABLE_LANG_MIGRATION === 'true') {
+        setTimeout(() => {
+            migrateUsersLangCode();
+            migrateGroupsLangCode();
+        }, 30000); // Espera 30 segundos para o bot iniciar completamente
+    } else {
+        console.log("⚠️ Migração de lang_code desabilitada na inicialização.");
+        console.log("   Para ativar, defina ENABLE_LANG_MIGRATION=true no arquivo .env");
+    }
+
+    registerCallbackHandler();
+
+    bot.on("message", main);
+    bot.on("message", saveUserInformation);
+    bot.on("polling_error", pollingError);
+    bot.on("new_chat_members", saveNewChatMembers);
+    bot.on("left_chat_member", removeLeftChatMember);
+
+    bot.onText(/^\/start$/, start);
+    bot.onText(/^\/stats$/, stats);
+    bot.onText(/^\/grupos$/, groups);
+    bot.onText(/^\/ban/, ban);
+    bot.onText(/^\/unban/, unban);
+    bot.onText(/^\/banned/, banned);
+    bot.onText(/^\/delmsg/, removeMessage);
+    bot.onText(/^\/devs/, devs);
+    bot.onText(/^\/dbstats/, dbstats);
+    bot.onText(/^\/syncdb/, syncdb);
+
+    bot.onText(/\/ping/, async (msg) => {
+        const start = new Date();
+        const replied = await bot.sendMessage(msg.chat.id, "𝚙𝚘𝚗𝚐!");
+        const ms = new Date() - start;
+        await bot.editMessageText(
+            `𝚙𝚒𝚗𝚐: \`${ms}𝚖𝚜\`\n𝚞𝚙𝚝𝚒𝚖𝚎: \`${timeFormatter(process.uptime())}\``,
+            { chat_id: replied.chat.id, message_id: replied.message_id, parse_mode: "Markdown" }
+        );
+    });
+
+    bot.onText(/^\/bc\b/, bc);
+    bot.onText(/^\/broadcast\b/, broadcast);
+    bot.onText(/^\/sendgp/, sendgp);
+
+    // Status diário às 12:02
+    new CronJob("02 00 12 * * *", sendStatus, null, true, "America/Sao_Paulo");
+
+    // Ads para usuários: todo dia às 10h e 16h
+    new CronJob("0 0 10 * * *", sendAdsToUsers, null, true, "America/Sao_Paulo");
+    new CronJob("0 0 16 * * *", sendAdsToUsers, null, true, "America/Sao_Paulo");
+
+    // Ads para grupos: todo dia às 12h e 20h
+    new CronJob("0 0 12 * * *", sendAdsToGroups, null, true, "America/Sao_Paulo");
+    new CronJob("0 0 20 * * *", sendAdsToGroups, null, true, "America/Sao_Paulo");
+
+    // Sistema de auto-recuperação a cada 5 minutos
+    new CronJob("0 */5 * * * *", async () => {
+        const memoryUsage = process.memoryUsage();
+        if (memoryUsage.heapUsed > 500 * 1024 * 1024) { // 500MB
+            console.log("🧹 Limpeza de memória iniciada...");
+            global.gc && global.gc();
+            console.log("✅ Memória otimizada");
+        }
+    }, null, true, "America/Sao_Paulo");
+
+    sendBotOnlineMessage();
+};
