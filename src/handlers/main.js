@@ -17,21 +17,25 @@ const BOT_USERNAME = process.env.BOT_USERNAME || "aliceevilloficialbot";
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 function is_dev(user_id) {
-    const devUsers = (process.env.DEV_USERS || "").split(",").map((s) => s.trim());
-    return devUsers.includes(user_id.toString());
+ return _devSet.has(user_id.toString());
 }
 
-const forbiddenWords = palavrasProibidas.palavras_proibidas;
+const _devSet = new Set((process.env.DEV_USERS || "").split(",").map((s) => s.trim()));
+
+const _forbiddenSet = new Set(palavrasProibidas.palavras_proibidas.map((w) => w.toLowerCase()));
 
 function containsUrl(text) {
-    if (typeof text !== "string") return false;
-    return /\b(?:https?:\/\/|www\.)\S+\.(?:[a-z]{2,})(?:\S*)?\b/gi.test(text);
+ if (typeof text !== "string") return false;
+ return /\b(?:https?:\/\/|www\.)\S+\.(?:[a-z]{2,})(?:\S*)?\b/gi.test(text);
 }
 
 function hasForbiddenWord(text) {
-    if (typeof text !== "string") return false;
-    const lower = text.toLowerCase();
-    return forbiddenWords.some((w) => lower.includes(w.toLowerCase()));
+ if (typeof text !== "string") return false;
+ const lower = text.toLowerCase();
+ for (const w of _forbiddenSet) {
+ if (lower.includes(w)) return true;
+ }
+ return false;
 }
 
 function timeFormatter(seconds) {
@@ -135,7 +139,7 @@ function cleanPaginationState() {
   }
 }
 
-setInterval(cleanPaginationState, 5 * 60 * 1000).unref();
+ setInterval(cleanPaginationState, 10 * 60 * 1000).unref();
 
 function buildNavMarkup(type, page, total) {
     const buttons = [];
@@ -222,7 +226,6 @@ async function sendReplyByType(chatId, replyToSend, replyToMessageId, knownType)
 
  if (type === "sticker") {
  await bot.sendChatAction(chatId, "choose_sticker");
- await delay(300);
  try {
  await bot.sendSticker(chatId, replyToSend, opts);
  } catch (err) {
@@ -234,7 +237,7 @@ async function sendReplyByType(chatId, replyToSend, replyToMessageId, knownType)
  }
  } else {
  await bot.sendChatAction(chatId, "typing");
- const typingTime = Math.min(Math.max(50 * replyToSend.length, 200), 6000);
+ const typingTime = Math.min(Math.max(30 * replyToSend.length, 150), 2000);
  await delay(typingTime);
  try {
  await bot.sendMessage(chatId, replyToSend, {
@@ -1451,30 +1454,17 @@ exports.initHandler = () => {
         );
     });
 
-    bot.onText(/^\/bc\b/, bc);
-    bot.onText(/^\/broadcast\b/, broadcast);
-    bot.onText(/^\/sendgp/, sendgp);
+ bot.onText(/^\/bc\b/, bc);
+ bot.onText(/^\/broadcast\b/, broadcast);
+ bot.onText(/^\/sendgp/, sendgp);
 
-    // Status diário às 12:02
-    new CronJob("02 00 12 * * *", sendStatus, null, true, "America/Sao_Paulo");
+ if (process.env.VERCEL !== "1") {
+ new CronJob("02 00 12 * * *", sendStatus, null, true, "America/Sao_Paulo");
+ new CronJob("0 0 10 * * *", sendAdsToUsers, null, true, "America/Sao_Paulo");
+ new CronJob("0 0 16 * * *", sendAdsToUsers, null, true, "America/Sao_Paulo");
+ new CronJob("0 0 12 * * *", sendAdsToGroups, null, true, "America/Sao_Paulo");
+ new CronJob("0 0 20 * * *", sendAdsToGroups, null, true, "America/Sao_Paulo");
+ }
 
-    // Ads para usuários: todo dia às 10h e 16h
-    new CronJob("0 0 10 * * *", sendAdsToUsers, null, true, "America/Sao_Paulo");
-    new CronJob("0 0 16 * * *", sendAdsToUsers, null, true, "America/Sao_Paulo");
-
-    // Ads para grupos: todo dia às 12h e 20h
-    new CronJob("0 0 12 * * *", sendAdsToGroups, null, true, "America/Sao_Paulo");
-    new CronJob("0 0 20 * * *", sendAdsToGroups, null, true, "America/Sao_Paulo");
-
-    // Sistema de auto-recuperação a cada 5 minutos
-    new CronJob("0 */5 * * * *", async () => {
-        const memoryUsage = process.memoryUsage();
-        if (memoryUsage.heapUsed > 500 * 1024 * 1024) { // 500MB
-            console.log("🧹 Limpeza de memória iniciada...");
-            global.gc && global.gc();
-            console.log("✅ Memória otimizada");
-        }
-    }, null, true, "America/Sao_Paulo");
-
-    sendBotOnlineMessage();
+ sendBotOnlineMessage();
 };

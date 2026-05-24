@@ -3,6 +3,14 @@ const { initHandler } = require("../src/handlers/main");
 const { connectDB } = require("../src/database");
 
 let handlerInitialized = false;
+let dbReady = false;
+let dbPromise = null;
+
+function ensureDB() {
+ if (dbReady) return Promise.resolve();
+ if (!dbPromise) dbPromise = connectDB().then(() => { dbReady = true; });
+ return dbPromise;
+}
 
 module.exports = async (req, res) => {
  if (req.method !== "POST") {
@@ -10,27 +18,22 @@ module.exports = async (req, res) => {
  }
 
  try {
- await connectDB();
-
  if (!handlerInitialized) {
- bot.deleteWebHook().catch(() => {});
- const baseUrl = `${req.headers["x-forwarded-proto"] || "https"}://${req.headers["host"]}`;
- await bot.setWebHook(`${baseUrl}/api/webhook`);
+ await ensureDB();
  initHandler();
  handlerInitialized = true;
+ } else if (!dbReady) {
+ await ensureDB();
  }
 
- if (req.body) {
- bot.processUpdate(req.body);
- } else {
- let body = "";
- for await (const chunk of req) {
- body += chunk;
+ let body = req.body;
+ if (!body) {
+ let raw = "";
+ for await (const chunk of req) raw += chunk;
+ body = raw ? JSON.parse(raw) : null;
  }
- if (body) {
- bot.processUpdate(JSON.parse(body));
- }
- }
+
+ if (body) bot.processUpdate(body);
 
  res.status(200).json({ ok: true });
  } catch (err) {
