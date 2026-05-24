@@ -430,6 +430,15 @@ async function saveNewChatMembers(msg) {
   }
 }
 
+async function removeLeftChatMember(msg) {
+  const botId = await getBotId();
+  if (msg.left_chat_member.id !== botId) return;
+  const chatId = msg.chat.id;
+  const chat = await ChatModel.findOne({ chatId });
+  if (!chat || chat.is_ban) return;
+  await ChatModel.findOneAndDelete({ chatId }).catch(() => {});
+}
+
 // ─── /syncdb (forçar sincronização de usuários/grupos via Telegram) ───────────
 
 async function syncdb(message) {
