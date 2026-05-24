@@ -8,14 +8,32 @@ if (process.env.NODE_ENV !== "production") {
  dotenv.config();
 }
 
-let conn = null;
+let cachedConn = null;
 
 async function connectDB() {
- if (conn && mongoose.connection.readyState === 1) return conn;
+ if (cachedConn && mongoose.connection.readyState === 1) return cachedConn;
 
- conn = await mongoose.connect(process.env.DB_STRING);
+ if (mongoose.connection.readyState === 1) {
+ cachedConn = mongoose.connection;
+ return cachedConn;
+ }
+
+ if (mongoose.connection.readyState === 2) {
+ await new Promise((resolve) => mongoose.connection.once("open", resolve));
+ cachedConn = mongoose.connection;
+ return cachedConn;
+ }
+
+ cachedConn = await mongoose.connect(process.env.DB_STRING, {
+ serverSelectionTimeoutMS: 10000,
+ connectTimeoutMS: 10000,
+ socketTimeoutMS: 30000,
+ maxPoolSize: 5,
+ minPoolSize: 1,
+ });
+
  console.log("MongoDB conectado com sucesso.");
- return conn;
+ return cachedConn;
 }
 
 const MessageModel = mongoose.model("Reply", MessageSchema, "alice_replies");
