@@ -370,28 +370,32 @@ async function saveNewChatMembers(msg) {
   const chatType = msg.chat.type || "unknown";
 
   try {
-    const chat = await ChatModel.findOne({ chatId }).catch(err => {
-      console.error(`[CHAT-FIND] Erro ao procurar grupo ${chatId}:`, err.message);
-      throw err;
-    });
+          const chat = await ChatModel.findOne({ chatId }).catch(err => {
+            console.error(`[CHAT-FIND] Erro ao procurar grupo ${chatId}:`, err.message);
+            throw err;
+          });
 
-    if (chat) {
-      if (chat.is_ban) {
-        await bot.leaveChat(chatId);
-      } else {
-        await ChatModel.findOneAndUpdate(
-          { chatId },
-          { chatName: chatName || chat.chatName, chat_type: chatType }
-        ).catch(() => {});
-      }
-      return;
-    }
+          if (chat) {
+            if (chat.is_ban) {
+              await bot.leaveChat(chatId);
+            } else {
+              await ChatModel.findOneAndUpdate(
+                { chatId },
+                { chatName: chatName || chat.chatName, chat_type: chatType }
+              ).catch(() => {});
+            }
+            return;
+          }
 
-    const created = await ChatModel.create({ chatId, chatName, chat_type: chatType, lang_code: "unknown" }).catch(err => {
-      console.error(`[CHAT-CREATE] Erro ao criar grupo ${chatId}:`, err.message);
-      throw err;
-    });
-    console.log(`[CHAT-CREATE] Grupo criado: ${chatId} - ${chatName} [${chatType}]`);
+          await ChatModel.findOneAndUpdate(
+            { chatId },
+            { $setOnInsert: { chatId, chatName, chat_type: chatType, lang_code: "unknown", is_ban: false }, $set: { chatName, chat_type: chatType } },
+            { upsert: true, returnDocument: "after" }
+          ).catch(err => {
+            console.error(`[CHAT-CREATE] Erro ao salvar grupo ${chatId}:`, err.message);
+            throw err;
+          });
+          console.log(`[CHAT-CREATE] Grupo salvo: ${chatId} - ${chatName} [${chatType}]`);
 
     const botUser = await bot.getMe();
     const addedNow = msg.new_chat_members?.some((m) => m.id === botUser.id);
@@ -414,142 +418,10 @@ async function saveNewChatMembers(msg) {
  `Olá, me chamo ${BOT_NAME}! Obrigado por me adicionar ao grupo. Vou responder as mensagens da galera aqui kkkkk.`,
  {
  reply_markup: {
- inline_keyboard: [
- [
- { text: "📣 Canal da Alice", url: "https://t.me/aliceevillcanal" },
- { text: "👨‍💻 Suporte", url: "https://t.me/lbrabo" },
- ],
- ],
- },
- }
- ).catch(() => {});
-    }
-
-    const devMembers = msg.new_chat_members?.filter((m) => !m.is_bot && is_dev(m.id));
-    if (devMembers?.length) {
-      bot.sendMessage(
-        chatId,
-        `👨‍💻 <b>Um dos meus desenvolvedores entrou no grupo:</b> <a href="tg://user?id=${devMembers[0].id}">${devMembers[0].first_name}</a> 😎`,
-        { parse_mode: "HTML" }
-      ).catch(() => {});
-    }
-  } catch (err) {
-    console.error(`[CHAT-SAVE-FATAL] Erro fatal ao salvar grupo:`, err.message);
-  }
-}
-
-async function removeLeftChatMember(msg) {
-    const botId = await getBotId();
-    if (msg.left_chat_member.id !== botId) return;
-    const chatId = msg.chat.id;
-    const chat = await ChatModel.findOne({ chatId });
-    if (!chat || chat.is_ban) return;
-    await ChatModel.findOneAndDelete({ chatId }).catch(() => {});
-}
-
-// ─── ensure user/group are saved ──────────────────────────────────────────────
-
-async function ensureUserSaved(message) {
-  const user = message.from;
-  if (!user || user.is_bot) return false;
-
-  const langCode = user.language_code || "unknown";
-
-  try {
-    const result = await UserModel.findOneAndUpdate(
-      { user_id: user.id },
-      {
-        $setOnInsert: {
-          user_id: user.id,
-          is_dev: false,
-        },
-        $set: {
-          username: user.username,
-          firstname: user.first_name,
-          lastname: user.last_name,
-          lang_code: langCode,
-        },
-      },
-      { upsert: true, returnDocument: "after" }
-    );
-    if (result._id) return true;
-    return false;
-  } catch (err) {
-    console.error(`[ENSURE-USER-ERROR] Falha ao salvar usuário ${user.id}:`, err.message);
-    return false;
-  }
-}
-
-async function ensureGroupSaved(msg) {
-  const chatId = msg.chat.id;
-  const chatName = msg.chat.title || msg.chat.username || `Group-${chatId}`;
-  const chatType = msg.chat.type || "unknown";
-
-  try {
-    const exists = await ChatModel.findOne({ chatId });
-
-    if (exists) {
-      if (exists.is_ban) return false;
-
-      await ChatModel.findOneAndUpdate(
-        { chatId },
-        {
-          chatName,
-          chat_type: chatType,
-          $setOnInsert: { lang_code: "unknown" }
-        }
-      );
-      return true;
-    }
-
-    await ChatModel.create({
-      chatId,
-      chatName,
-      chat_type: chatType,
-      lang_code: "unknown",
-      is_ban: false
-    });
-    console.log(`[ENSURE-GROUP] Novo grupo salvo: ${chatId} (${chatName}) [${chatType}]`);
-    return true;
-  } catch (err) {
-    console.error(`[ENSURE-GROUP-ERROR] Falha ao salvar grupo ${chatId}:`, err.message);
-    return false;
-  }
-}
-
-
-// ─── /start ───────────────────────────────────────────────────────────────────
-
-async function start(message) {
-    if (message.chat.type !== "private") return;
-    
-    // Garantir que usuário seja salvo
-    await ensureUserSaved(message);
-    
-    const userId = message.from.id;
-    const firstName = message.from.first_name;
-
- const devText =
- `Olá, <b>${firstName}</b>! Você é um dos desenvolvedores 🧑‍💻\n\n` +
- `Você está no painel do ${BOT_NAME}. Use os comandos com responsabilidade.`;
-
- const userText =
- `Olá, <b>${firstName}</b>!\n\n` +
- `Eu sou <b>${BOT_NAME}</b>, um bot que responde mensagens, áudios e figurinhas da galera 😄\n\n` +
- `📣 <b>Canal da Alice:</b> <a href="https://t.me/aliceevillcanal">@canal da alice</a>`;
-
- if (is_dev(userId)) {
- await bot.sendMessage(userId, devText, {
- parse_mode: "HTML",
- disable_web_page_preview: true,
- reply_markup: {
- inline_keyboard: [
- [
- { text: "📣 Canal da Alice", url: "https://t.me/aliceevillcanal" },
- { text: "👨‍💻 Suporte", url: "https://t.me/lbrabo" },
- ],
- [{ text: "🗃 Comandos do Dev", callback_data: "dev_commands" }],
- ],
+        inline_keyboard: [
+          [{ text: "📣 Canal da Alice", url: "https://t.me/aliceevillcanal" }],
+          [{ text: "🗃 Comandos do Dev", callback_data: "dev_commands" }],
+        ],
  },
  });
  } else {
@@ -558,11 +430,8 @@ async function start(message) {
  disable_web_page_preview: true,
  reply_markup: {
  inline_keyboard: [
- [{ text: "✨ Adicione-me em seu grupo", url: `https://t.me/${BOT_USERNAME}?startgroup=true` }],
- [
- { text: "📣 Canal da Alice", url: "https://t.me/aliceevillcanal" },
- { text: "👨‍💻 Suporte", url: "https://t.me/lbrabo" },
- ],
+[{ text: "✨ Adicione-me em seu grupo", url: `https://t.me/${BOT_USERNAME}?startgroup=true` }],
+          [{ text: "📣 Canal da Alice", url: "https://t.me/aliceevillcanal" }],
  ],
  },
  });
@@ -1315,11 +1184,8 @@ function registerCallbackHandler() {
  message_id: q.message.message_id,
  reply_markup: {
  inline_keyboard: [
- [
- { text: "📣 Canal da Alice", url: "https://t.me/aliceevillcanal" },
- { text: "👨‍💻 Suporte", url: "https://t.me/lbrabo" },
- ],
- [{ text: "🗃 Comandos do Dev", callback_data: "dev_commands" }],
+          [{ text: "📣 Canal da Alice", url: "https://t.me/aliceevillcanal" }],
+          [{ text: "🗃 Comandos do Dev", callback_data: "dev_commands" }],
  ],
  },
  })
